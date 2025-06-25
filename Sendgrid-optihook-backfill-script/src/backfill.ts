@@ -1,93 +1,108 @@
 /**
- * Retro-backfill SendGrid metrics → Optihook Pub/Sub topic
+ * SendGrid → Optihook retro-backfill
+ * ==================================
+ * Publishes any missing OPEN / CLICK events so that Optihook’s event rows match
+ * the *_COUNT columns stored in the SendGrid metrics table.
  *
- *   ts-node src/backfill.ts \
- *     --start 2024-01-01 \
- *     --end   2024-12-31
+ * Incrementality strategy
+ * -----------------------
+ * We checkpoint on the pair **(processed_time, sg_message_id)**, guaranteeing a
+ * strict total order even when several rows share the same millisecond:
  *
- * Environment variables:
- *   BQ_PROJECT      – GCP project that owns the table
- *   BQ_TABLE        – full table name e.g. cloudcore-prod-eu.chris_w_eu.dazn_events
- *   PUBSUB_TOPIC    – full Pub/Sub topic path
- *   CHUNK_DAYS      – days per query window      (default 3)
- *   BATCH_SIZE      – msgs per Pub/Sub publish   (default 1 000)
+ *   WHERE  PROCESSED_TIME  >  @ckptTs
+ *      OR (PROCESSED_TIME  =  @ckptTs AND MSGID > @ckptId)
+ *
+ * After every successful slice, we persist the greatest pair we’ve published.
+ *
+ * Other guard-rails
+ * -----------------
+ * • Gap-aware SQL: duplicates only missing OPEN/CLICK rows.                  \
+ * • Robust JSON parse for UNIQUE_ARGS.                                       \
+ * • Payload validation: events lacking required fields are skipped.          \
+ * • Pub/Sub publish retried 3× on transient errors.                          \
+ * • Local JSON checkpoint file (`CHECKPOINT_FILE`).                          \
+ * • Idempotent – safe to run repeatedly over the same date range.
+ *
+ * ---------------------------------------------------------------------------
+ * Usage
+ *   ts-node backfill.ts --start 2025-01-01 --end 2025-06-01
+ *
+ * Required env vars
+ *   BQ_PROJECT, BQ_TABLE, OPTIHOOK_TABLE, PUBSUB_TOPIC
+ *
+ * Optional env vars
+ *   CHUNK_DAYS       (default 3)
+ *   BATCH_SIZE       (default 1000)
+ *   CHECKPOINT_FILE  (default ./backfill.ckpt.json)
+ *   RUN_ID           (default epoch-ms)
+ * ---------------------------------------------------------------------------
  */
 
 import {BigQuery, BigQueryTimestamp} from '@google-cloud/bigquery';
-import {PubSub}   from '@google-cloud/pubsub';
-import yargs from 'yargs';
-import {hideBin} from 'yargs/helpers';
+import {PubSub}                      from '@google-cloud/pubsub';
+import yargs                         from 'yargs';
+import {hideBin}                     from 'yargs/helpers';
+import fs                            from 'fs/promises';
+import path                          from 'path';
 
-// ---------- CLI & env --------------------------------------------------------------------------
+// ─────────────────── CLI & ENV ───────────────────────────────────────────────
 
-const argv = yargs(hideBin(process.argv))
-    .option('start', {demandOption: true, type: 'string', desc: 'ISO start date (inclusive)'})
-    .option('end',   {demandOption: true, type: 'string', desc: 'ISO end date   (exclusive)'})
+const args = yargs(hideBin(process.argv))
+    .option('start', {demandOption: true, type: 'string'})
+    .option('end',   {demandOption: true, type: 'string'})
     .parseSync();
 
-const BQ_PROJECT   = process.env.BQ_PROJECT   ?? (() => {throw new Error('BQ_PROJECT env missing');})();
-const BQ_TABLE     = process.env.BQ_TABLE     ?? (() => {throw new Error('BQ_TABLE env missing');})();
-const PUBSUB_TOPIC = process.env.PUBSUB_TOPIC ?? (() => {throw new Error('PUBSUB_TOPIC env missing');})() ;
-const OPTIHOOK_TABLE = process.env.OPTIHOOK_TABLE
-    ?? (() => { throw new Error('OPTIHOOK_TABLE env missing'); })();
-
-const CHUNK_DAYS = +(process.env.CHUNK_DAYS ?? 1);
-const BATCH_SIZE = +(process.env.BATCH_SIZE ?? 1_000);
-
-// ---------- Clients ---------------------------------------------------------------------------
-
-const bigquery = new BigQuery({projectId: BQ_PROJECT});
-const pubsub   = new PubSub();
-const topic    = pubsub.topic(PUBSUB_TOPIC);
-
-// ---------- Helpers ----------------------------------------------------------------------------
-
-function fmt(date: Date): string {
-    // YYYY-MM-DD
-    return date.toISOString().slice(0, 10);
+function env(name: string, def?: string): string {
+    const v = process.env[name] ?? def;
+    if (v == null) throw new Error(`${name} env missing`);
+    return v;
 }
 
-const EVENT_RULES = [
-    {
-        name: 'processed',
-        filter: 'TRUE',
-        ts:     'PROCESSED_TIME',
-        ip:     'NULL',
-        extras: 'SG_MACHINE_OPEN, OPEN_USER_AGENT',
-    },
-    {
-        name: 'delivered',
-        filter: "DELIVERED = 'true'",
-        ts:     'DELIVERED_TIME',
-        ip:     'DELIVERED_IP',
-        extras: 'NULL, NULL',
-    },
-    {
-        name: 'open',
-        filter: 'SAFE_CAST(OPEN_COUNT AS INT64) > 0',
-        ts:     'OPEN_FIRST_TIME',
-        ip:     'OPEN_IP',
-        extras: 'SG_MACHINE_OPEN, OPEN_USER_AGENT',
-    },
-    {
-        name: 'click',
-        filter: 'SAFE_CAST(CLICK_COUNT AS INT64) > 0',
-        ts:     'CLICK_FIRST_TIME',
-        ip:     'CLICK_IP',
-        extras: 'NULL, CLICK_USER_AGENT',
-    },
-    {
-        name: 'unsubscribed',
-        filter: 'UNSUBSCRIBED IS NOT NULL',
-        ts:     'UNSUBSCRIBED_TIME',
-        ip:     'UNSUBSCRIBED_IP',
-        extras: 'NULL, UNSUBSCRIBED_USER_AGENT',
-    },
-];
+const projectId       = env('BQ_PROJECT');
+const metricsTable    = env('BQ_TABLE');
+const optihookTable   = env('OPTIHOOK_TABLE');
+const topicPath       = env('PUBSUB_TOPIC');
 
-function buildQuery(start: string, end: string): string {
+const chunkDays       = +env('CHUNK_DAYS',      '3');
+const batchSize       = +env('BATCH_SIZE',      '1000');
+const ckptFile        = path.resolve(env('CHECKPOINT_FILE', './backfill.ckpt.json'));
+const runId           = env('RUN_ID', `${Date.now()}`);
+
+// ─────────────────── GCP CLIENTS ─────────────────────────────────────────────
+
+const bigQuery = new BigQuery({projectId});
+const pubsub   = new PubSub();
+const topic    = pubsub.topic(topicPath);
+
+// ─────────────────── HELPERS ─────────────────────────────────────────────────
+
+const DAY_MS = 86_400_000;
+const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+
+function safeJson(txt: string | null){
+    if (!txt) return {};
+    try { return JSON.parse(txt); } catch { return {} as Record<string, unknown>; }
+}
+
+// ─────────────────── CHECKPOINT I/O ──────────────────────────────────────────
+
+type Checkpoint = { ts: string; id: string }; // processed_time ISO + msgid
+
+async function loadCheckpoint(): Promise<Checkpoint> {
+    try { return JSON.parse(await fs.readFile(ckptFile, 'utf8')); }
+    catch { return {ts: '1970-01-01T00:00:00Z', id: ''}; }
+}
+
+async function saveCheckpoint(cp: Checkpoint): Promise<void> {
+    await fs.mkdir(path.dirname(ckptFile), {recursive: true});
+    await fs.writeFile(ckptFile, JSON.stringify(cp));
+}
+
+// ─────────────────── GAP-AWARE QUERY ────────────────────────────────────────
+
+function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
     return `
-  /* -------- source rows from the SendGrid metrics table -------- */
+  -- rows in requested date window and strictly greater than checkpoint
   WITH src AS (
     SELECT
       MSGID                            AS sg_message_id,
@@ -95,238 +110,208 @@ function buildQuery(start: string, end: string): string {
       UNIQUE_ARGS,
       SAFE_CAST(OPEN_COUNT  AS INT64)  AS open_cnt,
       SAFE_CAST(CLICK_COUNT AS INT64)  AS click_cnt,
-
-      -- per-event columns
       PROCESSED_TIME,
-      DELIVERED,
-      DELIVERED_TIME,
-      DELIVERED_IP,
 
-      OPEN_FIRST_TIME,
-      OPEN_IP,
-      SG_MACHINE_OPEN,
-      OPEN_USER_AGENT,
-
-      CLICK_FIRST_TIME,
-      CLICK_IP,
-      CLICK_USER_AGENT,
-
-      UNSUBSCRIBED,
-      UNSUBSCRIBED_TIME,
-      UNSUBSCRIBED_IP,
-      UNSUBSCRIBED_USER_AGENT
-    FROM \`${BQ_TABLE}\`
+      DELIVERED, DELIVERED_TIME, DELIVERED_IP,
+      OPEN_FIRST_TIME, OPEN_IP, SG_MACHINE_OPEN, OPEN_USER_AGENT,
+      CLICK_FIRST_TIME, CLICK_IP, CLICK_USER_AGENT,
+      UNSUBSCRIBED, UNSUBSCRIBED_TIME, UNSUBSCRIBED_IP, UNSUBSCRIBED_USER_AGENT
+    FROM \`${metricsTable}\`
     WHERE PROCESSED_TIME >= TIMESTAMP('${start}')
       AND PROCESSED_TIME <  TIMESTAMP('${end}')
+      AND (
+            PROCESSED_TIME  > TIMESTAMP('${ckpt.ts}')
+         OR (PROCESSED_TIME = TIMESTAMP('${ckpt.ts}') AND MSGID > '${ckpt.id}')
+      )
   ),
 
-  /* -------- what we've already pushed to Optihook -------- */
   existing AS (
-    SELECT
-      sg_message_id,
-      event,
-      COUNT(*) AS pushed
-    FROM \`${OPTIHOOK_TABLE}\`
-    WHERE sg_message_id IN (SELECT sg_message_id FROM src)   -- small scan
-    GROUP BY sg_message_id, event
+    SELECT sg_message_id, event, COUNT(*) AS pushed
+    FROM   \`${optihookTable}\`
+    WHERE  sg_message_id IN (SELECT sg_message_id FROM src)
+    GROUP  BY sg_message_id, event
   ),
 
-  /* -------- events that can occur only once per message -------- */
   singles AS (
-    /* processed */
-    SELECT
-      s.sg_message_id, s.EMAIL, s.UNIQUE_ARGS,
-      'processed'          AS event,
-      s.PROCESSED_TIME     AS evt_ts,
-      NULL                 AS ip,
-      s.SG_MACHINE_OPEN,
-      s.OPEN_USER_AGENT,
-      NULL                 AS CLICK_USER_AGENT
-    FROM src s
-    LEFT JOIN existing e
-      ON  e.sg_message_id = s.sg_message_id
-      AND e.event        = 'processed'
-    WHERE e.sg_message_id IS NULL
+    -- processed
+    SELECT s.*, 'processed' AS event, s.PROCESSED_TIME AS evt_ts,
+           NULL ip, s.SG_MACHINE_OPEN, s.OPEN_USER_AGENT, NULL CLICK_USER_AGENT
+    FROM   src s
+    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'processed'
+    WHERE  e.sg_message_id IS NULL
 
     UNION ALL
-
-    /* delivered */
-    SELECT
-      s.sg_message_id, s.EMAIL, s.UNIQUE_ARGS,
-      'delivered',
-      s.DELIVERED_TIME,
-      s.DELIVERED_IP,
-      NULL, NULL, NULL
-    FROM src s
-    LEFT JOIN existing e
-      ON  e.sg_message_id = s.sg_message_id
-      AND e.event        = 'delivered'
-    WHERE s.DELIVERED = 'true'
-      AND e.sg_message_id IS NULL
+    -- delivered
+    SELECT s.*, 'delivered', s.DELIVERED_TIME, s.DELIVERED_IP,
+           NULL, NULL, NULL
+    FROM   src s
+    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'delivered'
+    WHERE  s.DELIVERED = 'true' AND e.sg_message_id IS NULL
 
     UNION ALL
-
-    /* unsubscribed */
-    SELECT
-      s.sg_message_id, s.EMAIL, s.UNIQUE_ARGS,
-      'unsubscribed',
-      s.UNSUBSCRIBED_TIME,
-      s.UNSUBSCRIBED_IP,
-      NULL, NULL, s.UNSUBSCRIBED_USER_AGENT
-    FROM src s
-    LEFT JOIN existing e
-      ON  e.sg_message_id = s.sg_message_id
-      AND e.event        = 'unsubscribed'
-    WHERE s.UNSUBSCRIBED IS NOT NULL
-      AND e.sg_message_id IS NULL
+    -- unsubscribed
+    SELECT s.*, 'unsubscribed', s.UNSUBSCRIBED_TIME, s.UNSUBSCRIBED_IP,
+           NULL, NULL, s.UNSUBSCRIBED_USER_AGENT
+    FROM   src s
+    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'unsubscribed'
+    WHERE  s.UNSUBSCRIBED IS NOT NULL AND e.sg_message_id IS NULL
   ),
 
-  /* -------- events that can repeat (open / click) -------- */
   gaps AS (
-    /* OPEN */
-    SELECT
-      s.sg_message_id, s.EMAIL, s.UNIQUE_ARGS,
-      'open'                 AS event,
-      s.OPEN_FIRST_TIME      AS evt_ts,
-      s.OPEN_IP              AS ip,
-      s.SG_MACHINE_OPEN,
-      s.OPEN_USER_AGENT,
-      NULL                   AS CLICK_USER_AGENT,
-      GREATEST(s.open_cnt - COALESCE(e.pushed, 0), 0) AS gap
-    FROM src s
-    LEFT JOIN existing e
-      ON  e.sg_message_id = s.sg_message_id
-      AND e.event        = 'open'
-    WHERE s.open_cnt > COALESCE(e.pushed, 0)
+    -- open
+    SELECT s.*, 'open' AS event, s.OPEN_FIRST_TIME AS evt_ts, s.OPEN_IP AS ip,
+           s.SG_MACHINE_OPEN, s.OPEN_USER_AGENT, NULL CLICK_USER_AGENT,
+           GREATEST(s.open_cnt - COALESCE(e.pushed, 0), 0) AS gap
+    FROM   src s
+    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'open'
+    WHERE  s.open_cnt > COALESCE(e.pushed, 0)
 
     UNION ALL
-
-    /* CLICK */
-    SELECT
-      s.sg_message_id, s.EMAIL, s.UNIQUE_ARGS,
-      'click',
-      s.CLICK_FIRST_TIME,
-      s.CLICK_IP,
-      NULL                   AS SG_MACHINE_OPEN,
-      NULL                   AS OPEN_USER_AGENT,
-      s.CLICK_USER_AGENT,
-      GREATEST(s.click_cnt - COALESCE(e.pushed, 0), 0) AS gap
-    FROM src s
-    LEFT JOIN existing e
-      ON  e.sg_message_id = s.sg_message_id
-      AND e.event        = 'click'
-    WHERE s.click_cnt > COALESCE(e.pushed, 0)
+    -- click
+    SELECT s.*, 'click', s.CLICK_FIRST_TIME, s.CLICK_IP,
+           NULL, NULL, s.CLICK_USER_AGENT,
+           GREATEST(s.click_cnt - COALESCE(e.pushed, 0), 0) AS gap
+    FROM   src s
+    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'click'
+    WHERE  s.click_cnt > COALESCE(e.pushed, 0)
   )
 
-  /* -------- final result set -------- */
   SELECT
     sg_message_id, EMAIL, UNIQUE_ARGS, event, evt_ts, ip,
-    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT
-  FROM singles         -- single-occurrence events
+    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT, PROCESSED_TIME
+  FROM singles
 
   UNION ALL
 
-  /* for opens and clicks: repeat the row 'gap' times */
   SELECT
     sg_message_id, EMAIL, UNIQUE_ARGS, event, evt_ts, ip,
-    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT
-  FROM gaps, UNNEST(GENERATE_ARRAY(1, gap)) AS _fanout;
+    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT, PROCESSED_TIME
+  FROM gaps, UNNEST(GENERATE_ARRAY(1, gap))
+  ORDER BY PROCESSED_TIME, sg_message_id;
   `;
 }
 
+// ─────────────────── ROW → PAYLOAD + VALIDATION ─────────────────────────────
 
-
-type Row = {
+interface MetricsRow {
     sg_message_id: string;
     EMAIL: string;
-    UNIQUE_ARGS: string;
+    UNIQUE_ARGS: string | null;
     event: string;
     evt_ts: BigQueryTimestamp | null;
     ip: string | null;
     SG_MACHINE_OPEN: boolean | null;
     OPEN_USER_AGENT: string | null;
     CLICK_USER_AGENT: string | null;
-};
+    PROCESSED_TIME: BigQueryTimestamp;
+}
 
-function rowToPayload(row: Row): Record<string, unknown> {
-    const ua = row.UNIQUE_ARGS ? JSON.parse(row.UNIQUE_ARGS) : {};
+const requiredPaths: (string | string[])[] = [
+    'event',
+    'category',
+    'origin',
+    'tenant_id',
+    'customer',
+    ['context', 'execution_gateway'],
+    'insertion_time',
+    'send_id',
+    'execution_date',
+];
+
+function has(obj: any, p: string | string[]): boolean {
+    if (Array.isArray(p)) {
+        let cur = obj;
+        for (const k of p) { if (cur == null || !(k in cur)) return false; cur = cur[k]; }
+        return cur != null;
+    }
+    return obj[p] != null;
+}
+
+function isValid(p: Record<string, unknown>): boolean {
+    return requiredPaths.every(r => has(p, r));
+}
+
+function toPayload(row: MetricsRow): Record<string, unknown> {
+    const ua = safeJson(row.UNIQUE_ARGS);
+
     return {
-        brand:               ua.brand,
-        cancel_id:           ua.cancel_id,
-        customer:            ua.customer,
-        email:               row.EMAIL,
-        event:               row.event,
-        execution_date:      ua.execution_date,
-        execution_datetime:  ua.execution_datetime,
-        ip:                  row.ip,
-        is_hashed:           ua.is_hashed,
-        optimove_mail_name:  ua.optimove_mail_name,
-        region:              ua.region,
-        sendAt:              ua.sendAt,
-        send_id:             ua.send_id,
-        sg_machine_open:     row.event === 'open' ? !!row.SG_MACHINE_OPEN : false,
-        sg_message_id:       row.sg_message_id,
-        tenant_id:           ua.tenant_id ? +ua.tenant_id : undefined,
-        timestamp:           row.evt_ts?.value ?? new Date().toISOString(),
-        useragent:           row.OPEN_USER_AGENT ?? row.CLICK_USER_AGENT,
-        insertion_time:      new Date().toISOString(),
-        origin:              'optimail',
-        category:            'metric',
-        context:             {execution_gateway: 'sendgrid'},
+        run_id:            runId,
+        brand:             ua['brand'],
+        cancel_id:         ua['cancel_id'],
+        customer:          ua['customer'],
+        email:             row.EMAIL,
+        event:             row.event,
+        execution_date:    ua['execution_date'],
+        execution_datetime:ua['execution_datetime'],
+        ip:                row.ip,
+        is_hashed:         ua['is_hashed'],
+        optimove_mail_name:ua['optimove_mail_name'],
+        region:            ua['region'],
+        sendAt:            ua['sendAt'],
+        send_id:           ua['send_id'],
+        sg_machine_open:   row.event === 'open' ? !!row.SG_MACHINE_OPEN : false,
+        sg_message_id:     row.sg_message_id,
+        tenant_id:         ua['tenant_id'] ? +ua['tenant_id'] : null,
+        timestamp:         row.evt_ts?.value ?? new Date().toISOString(),
+        useragent:         row.OPEN_USER_AGENT ?? row.CLICK_USER_AGENT,
+        insertion_time:    new Date().toISOString(),
+
+        origin:            'optimail',
+        category:          'metric',
+        context:           {execution_gateway: 'sendgrid'},
     };
 }
 
-// ---------- Main driver ------------------------------------------------------------------------
+// ─────────────────── BATCH PUBLISH WITH RETRY ────────────────────────────────
 
-async function publishBatch(msgs: Buffer[]) {
-    await topic.publishMessage({
-        data: Buffer.from(JSON.stringify(msgs.map(b => JSON.parse(b.toString()))))
-    });
+async function publish(messages: Record<string, unknown>[]): Promise<void> {
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            await topic.publishMessage({data: Buffer.from(JSON.stringify(messages))});
+            return;
+        } catch (e) {
+            console.error(`Publish failed (attempt ${attempt})`, (e as Error).message);
+            if (attempt === 3) throw e;
+            await new Promise(r => setTimeout(r, attempt * 1_000));
+        }
+    }
 }
 
-async function backfill(startISO: string, endISO: string) {
-    let cursor = new Date(startISO);
-    const end   = new Date(endISO);
-    let total   = 0;
+// ─────────────────── MAIN LOOP ───────────────────────────────────────────────
 
-    while (cursor < end) {
-        const chunkEnd = new Date(cursor);
-        chunkEnd.setDate(chunkEnd.getDate() + CHUNK_DAYS);
-        if (chunkEnd > end) chunkEnd.setTime(end.getTime());
+async function backfill(): Promise<void> {
+    let ckpt = await loadCheckpoint();
+    let sliceStart = new Date(args.start);
+    const endDate  = new Date(args.end);
+    let total      = 0;
 
-        const query = buildQuery(fmt(cursor), fmt(chunkEnd));
+    while (sliceStart < endDate) {
+        const sliceEnd = new Date(Math.min(sliceStart.getTime() + chunkDays * DAY_MS, endDate.getTime()));
 
-        const [job] = await bigquery.createQueryJob({query, useLegacySql: false});
+        const sql = buildQuery(isoDay(sliceStart), isoDay(sliceEnd), ckpt);
+        const [job] = await bigQuery.createQueryJob({query: sql, useLegacySql: false});
         const stream = job.getQueryResultsStream({maxResults: 10_000});
 
-        let batch: Buffer[] = [];
+        const batch: Record<string, unknown>[] = [];
+        for await (const row of stream) {
+            const payload = toPayload(row as MetricsRow);
+            if (!isValid(payload)) { console.debug('skip invalid', payload.sg_message_id); continue; }
 
-        for await (const rowAny of stream) {
-            const row = rowAny as Row;
-            batch.push(Buffer.from(JSON.stringify(rowToPayload(row))));
-            if (batch.length >= BATCH_SIZE) {
-                await publishBatch(batch);
-                total += batch.length;
-                batch = [];
-            }
-        }
-        if (batch.length) {
-            await publishBatch(batch);
-            total += batch.length;
-        }
+            batch.push(payload);
 
-        console.log(
-            `Processed slice ${fmt(cursor)} → ${fmt(chunkEnd)}  (${total} msgs so far)`,
-        );
-        cursor = chunkEnd;
+
+            if (batch.length >= batchSize) { await publish(batch); total += batch.length; batch.length = 0; }
+            ckpt = {ts: (row as MetricsRow).PROCESSED_TIME.value, id: (row as MetricsRow).sg_message_id};
+        }
+        if (batch.length) { await publish(batch); total += batch.length; }
+
+        await saveCheckpoint(ckpt);
+        console.log(`✔ ${isoDay(sliceStart)} → ${isoDay(sliceEnd)} (${total} rows)`);
+        sliceStart = sliceEnd;
     }
 
-    console.log(`✔ Finished. Published ${total} messages.`);
+    console.log(`✔ Run ${runId} finished – published ${total} events.`);
 }
 
-// ---------- Fire ------------------------------------------------------------------------------
-
-backfill(argv.start, argv.end).catch(err => {
-    console.error(err);
-    process.exitCode = 1;
-});
+// kick off
+backfill().catch(err => { console.error(err); process.exitCode = 1; });
