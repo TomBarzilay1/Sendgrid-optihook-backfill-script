@@ -125,7 +125,7 @@ async function main() {
        UNSUBSCRIBED, UNSUBSCRIBED_TIME, UNSUBSCRIBED_IP, UNSUBSCRIBED_USER_AGENT,
        SG_MACHINE_OPEN, DATA_RESIDENCY)
     VALUES
-    -- delivered + open
+    --processed + delivered +  2 open - 4
     ('msg_001','alice@example.com','example.com','u1','r1','Dummy subj 1',NULL,
      '{"brand":"AA01","cancel_id":"c1","customer":"cust1","execution_date":"2025-06-14","execution_datetime":"1749918600","is_hashed":"false","optimove_mail_name":"Mail1","region":"eu","sendAt":"1749918600","send_id":"0.1","tenant_id":"3014"}',
      '"BrandX" <noreply@brandx.com>',
@@ -135,7 +135,7 @@ async function main() {
      NULL, NULL, NULL, NULL,
      TRUE,'global'),
 
-    -- processed only
+    -- processed only - 1
     ('msg_002','bob@example.com','example.com','u2','r2','Dummy subj 2',NULL,
      '{"brand":"BB02","cancel_id":"c2","customer":"cust2","execution_date":"2025-06-14","execution_datetime":"1749918601","is_hashed":"false","optimove_mail_name":"Mail2","region":"us","sendAt":"1749918601","send_id":"0.2","tenant_id":"3014"}',
      '"BrandX" <noreply@brandx.com>',
@@ -145,7 +145,7 @@ async function main() {
      NULL,NULL,NULL,NULL,
      NULL,'global'),
 
-    -- click only
+    --processed + delivered + 4 click - 6 
     ('msg_003','carol@example.com','example.com','u3','r3','Dummy subj 3',NULL,
      '{"brand":"CC03","cancel_id":"c3","customer":"cust3","execution_date":"2025-06-14","execution_datetime":"1749918602","is_hashed":"true","optimove_mail_name":"Mail3","region":"eu","sendAt":"1749918602","send_id":"0.3","tenant_id":"3014"}',
      '"BrandX" <noreply@brandx.com>',
@@ -155,7 +155,7 @@ async function main() {
      NULL,NULL,NULL,NULL,
      NULL,'global'),
 
-    -- unsubscribed
+    --processed + unsubscribed + delivered - 3
     ('msg_004','dave@example.com','example.com','u4','r4','Dummy subj 4',NULL,
      '{"brand":"DD04","cancel_id":"c4","customer":"cust4","execution_date":"2025-06-14","execution_datetime":"1749918603","is_hashed":"false","optimove_mail_name":"Mail4","region":"us","sendAt":"1749918603","send_id":"0.4","tenant_id":"3014"}',
      '"BrandX" <noreply@brandx.com>',
@@ -165,7 +165,7 @@ async function main() {
      'yes', CURRENT_TIMESTAMP(),'6.6.6.6','Mozilla/5.0',
      NULL,'global'),
 
-    -- delivered only
+    -- delivered + processed - 2
     ('msg_005','eve@example.com','example.com','u5','r5','Dummy subj 5',NULL,
      '{"brand":"EE05","cancel_id":"c5","customer":"cust5","execution_date":"2025-06-14","execution_datetime":"1749918604","is_hashed":"true","optimove_mail_name":"Mail5","region":"eu","sendAt":"1749918604","send_id":"0.5","tenant_id":"3014"}',
      '"BrandX" <noreply@brandx.com>',
@@ -176,7 +176,7 @@ async function main() {
      NULL,'global')
   `);
 
-    console.log('✔ Inserted 5 rich dummy rows');
+    console.log('✔ Inserted 5 rich dummy rows should be total of 16 events');
 }
 
 main().catch(err => {

@@ -100,9 +100,14 @@ async function saveCheckpoint(cp: Checkpoint): Promise<void> {
 
 // ─────────────────── GAP-AWARE QUERY ────────────────────────────────────────
 
+/** Build the gap-aware SQL.
+ *  @param start  YYYY-MM-DD (inclusive)
+ *  @param end    YYYY-MM-DD (exclusive)
+ *  @param ckpt   current checkpoint tuple { ts: ISO string, id: msg-id }
+ */
 function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
     return `
-  -- rows in requested date window and strictly greater than checkpoint
+  /* ── slice from SendGrid metrics that is newer than the checkpoint ───────── */
   WITH src AS (
     SELECT
       MSGID                            AS sg_message_id,
@@ -112,11 +117,24 @@ function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
       SAFE_CAST(CLICK_COUNT AS INT64)  AS click_cnt,
       PROCESSED_TIME,
 
-      DELIVERED, DELIVERED_TIME, DELIVERED_IP,
-      OPEN_FIRST_TIME, OPEN_IP, SG_MACHINE_OPEN, OPEN_USER_AGENT,
-      CLICK_FIRST_TIME, CLICK_IP, CLICK_USER_AGENT,
-      UNSUBSCRIBED, UNSUBSCRIBED_TIME, UNSUBSCRIBED_IP, UNSUBSCRIBED_USER_AGENT
-    FROM \`${metricsTable}\`
+      DELIVERED,
+      DELIVERED_TIME,
+      DELIVERED_IP,
+
+      OPEN_FIRST_TIME,
+      OPEN_IP,
+      SG_MACHINE_OPEN,
+      OPEN_USER_AGENT,
+
+      CLICK_FIRST_TIME,
+      CLICK_IP,
+      CLICK_USER_AGENT,
+
+      UNSUBSCRIBED,
+      UNSUBSCRIBED_TIME,
+      UNSUBSCRIBED_IP,
+      UNSUBSCRIBED_USER_AGENT
+    FROM \`${optihookTable}\`
     WHERE PROCESSED_TIME >= TIMESTAMP('${start}')
       AND PROCESSED_TIME <  TIMESTAMP('${end}')
       AND (
@@ -125,71 +143,146 @@ function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
       )
   ),
 
+  /* ── how many rows we have already pushed per (message,event) ─────────────── */
   existing AS (
     SELECT sg_message_id, event, COUNT(*) AS pushed
-    FROM   \`${optihookTable}\`
+    FROM   \`${metricsTable}\`
     WHERE  sg_message_id IN (SELECT sg_message_id FROM src)
     GROUP  BY sg_message_id, event
   ),
 
+  /* ── events that should exist at most once per message ────────────────────── */
   singles AS (
-    -- processed
-    SELECT s.*, 'processed' AS event, s.PROCESSED_TIME AS evt_ts,
-           NULL ip, s.SG_MACHINE_OPEN, s.OPEN_USER_AGENT, NULL CLICK_USER_AGENT
-    FROM   src s
-    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'processed'
-    WHERE  e.sg_message_id IS NULL
+    /* processed */
+    SELECT
+      s.sg_message_id,
+      s.EMAIL,
+      s.UNIQUE_ARGS,
+      'processed'                AS event,
+      s.PROCESSED_TIME           AS evt_ts,
+      NULL                       AS ip,
+      s.SG_MACHINE_OPEN,
+      s.OPEN_USER_AGENT,
+      NULL                       AS CLICK_USER_AGENT,
+      s.PROCESSED_TIME           AS PROCESSED_TIME
+    FROM src s
+    LEFT JOIN existing e
+      ON e.sg_message_id = s.sg_message_id AND e.event = 'processed'
+    WHERE e.sg_message_id IS NULL
 
     UNION ALL
-    -- delivered
-    SELECT s.*, 'delivered', s.DELIVERED_TIME, s.DELIVERED_IP,
-           NULL, NULL, NULL
-    FROM   src s
-    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'delivered'
-    WHERE  s.DELIVERED = 'true' AND e.sg_message_id IS NULL
+
+    /* delivered */
+    SELECT
+      s.sg_message_id,
+      s.EMAIL,
+      s.UNIQUE_ARGS,
+      'delivered',
+      s.DELIVERED_TIME,
+      s.DELIVERED_IP,
+      NULL,
+      NULL,
+      NULL,
+      s.PROCESSED_TIME
+    FROM src s
+    LEFT JOIN existing e
+      ON e.sg_message_id = s.sg_message_id AND e.event = 'delivered'
+    WHERE s.DELIVERED = 'true' AND e.sg_message_id IS NULL
 
     UNION ALL
-    -- unsubscribed
-    SELECT s.*, 'unsubscribed', s.UNSUBSCRIBED_TIME, s.UNSUBSCRIBED_IP,
-           NULL, NULL, s.UNSUBSCRIBED_USER_AGENT
-    FROM   src s
-    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'unsubscribed'
-    WHERE  s.UNSUBSCRIBED IS NOT NULL AND e.sg_message_id IS NULL
+
+    /* unsubscribed */
+    SELECT
+      s.sg_message_id,
+      s.EMAIL,
+      s.UNIQUE_ARGS,
+      'unsubscribed',
+      s.UNSUBSCRIBED_TIME,
+      s.UNSUBSCRIBED_IP,
+      NULL,
+      NULL,
+      s.UNSUBSCRIBED_USER_AGENT,
+      s.PROCESSED_TIME
+    FROM src s
+    LEFT JOIN existing e
+      ON e.sg_message_id = s.sg_message_id AND e.event = 'unsubscribed'
+    WHERE s.UNSUBSCRIBED IS NOT NULL AND e.sg_message_id IS NULL
   ),
 
+  /* ── events that may repeat (open / click) and need gap fan-out ───────────── */
   gaps AS (
-    -- open
-    SELECT s.*, 'open' AS event, s.OPEN_FIRST_TIME AS evt_ts, s.OPEN_IP AS ip,
-           s.SG_MACHINE_OPEN, s.OPEN_USER_AGENT, NULL CLICK_USER_AGENT,
-           GREATEST(s.open_cnt - COALESCE(e.pushed, 0), 0) AS gap
-    FROM   src s
-    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'open'
-    WHERE  s.open_cnt > COALESCE(e.pushed, 0)
+    /* open */
+    SELECT
+      s.sg_message_id,
+      s.EMAIL,
+      s.UNIQUE_ARGS,
+      'open'                     AS event,
+      s.OPEN_FIRST_TIME          AS evt_ts,
+      s.OPEN_IP                  AS ip,
+      s.SG_MACHINE_OPEN,
+      s.OPEN_USER_AGENT,
+      NULL                       AS CLICK_USER_AGENT,
+      s.PROCESSED_TIME           AS PROCESSED_TIME,
+      GREATEST(s.open_cnt - COALESCE(e.pushed, 0), 0) AS gap
+    FROM src s
+    LEFT JOIN existing e
+      ON e.sg_message_id = s.sg_message_id AND e.event = 'open'
+    WHERE s.open_cnt > COALESCE(e.pushed, 0)
 
     UNION ALL
-    -- click
-    SELECT s.*, 'click', s.CLICK_FIRST_TIME, s.CLICK_IP,
-           NULL, NULL, s.CLICK_USER_AGENT,
-           GREATEST(s.click_cnt - COALESCE(e.pushed, 0), 0) AS gap
-    FROM   src s
-    LEFT   JOIN existing e ON e.sg_message_id = s.sg_message_id AND e.event = 'click'
-    WHERE  s.click_cnt > COALESCE(e.pushed, 0)
+
+    /* click */
+    SELECT
+      s.sg_message_id,
+      s.EMAIL,
+      s.UNIQUE_ARGS,
+      'click',
+      s.CLICK_FIRST_TIME,
+      s.CLICK_IP,
+      NULL,
+      NULL,
+      s.CLICK_USER_AGENT,
+      s.PROCESSED_TIME,
+      GREATEST(s.click_cnt - COALESCE(e.pushed, 0), 0) AS gap
+    FROM src s
+    LEFT JOIN existing e
+      ON e.sg_message_id = s.sg_message_id AND e.event = 'click'
+    WHERE s.click_cnt > COALESCE(e.pushed, 0)
   )
 
+  /* ── final union + fan-out ────────────────────────────────────────────────── */
   SELECT
-    sg_message_id, EMAIL, UNIQUE_ARGS, event, evt_ts, ip,
-    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT, PROCESSED_TIME
+    sg_message_id,
+    EMAIL,
+    UNIQUE_ARGS,
+    event,
+    evt_ts,
+    ip,
+    SG_MACHINE_OPEN,
+    OPEN_USER_AGENT,
+    CLICK_USER_AGENT,
+    PROCESSED_TIME
   FROM singles
 
   UNION ALL
 
   SELECT
-    sg_message_id, EMAIL, UNIQUE_ARGS, event, evt_ts, ip,
-    SG_MACHINE_OPEN, OPEN_USER_AGENT, CLICK_USER_AGENT, PROCESSED_TIME
-  FROM gaps, UNNEST(GENERATE_ARRAY(1, gap))
+    sg_message_id,
+    EMAIL,
+    UNIQUE_ARGS,
+    event,
+    evt_ts,
+    ip,
+    SG_MACHINE_OPEN,
+    OPEN_USER_AGENT,
+    CLICK_USER_AGENT,
+    PROCESSED_TIME
+  FROM gaps, UNNEST(GENERATE_ARRAY(1, gap)) AS _
+
   ORDER BY PROCESSED_TIME, sg_message_id;
   `;
 }
+
 
 // ─────────────────── ROW → PAYLOAD + VALIDATION ─────────────────────────────
 
