@@ -59,7 +59,7 @@ function env(name: string, def?: string): string {
 }
 
 const projectId       = env('BQ_PROJECT');
-const metricsTable    = env('BQ_TABLE');
+const metricsFromSendgridTable    = env('BQ_TABLE');
 const optihookTable   = env('OPTIHOOK_TABLE');
 const topicPath       = env('PUBSUB_TOPIC');
 
@@ -86,15 +86,22 @@ function safeJson(txt: string | null){
 
 // ─────────────────── CHECKPOINT I/O ──────────────────────────────────────────
 
-type Checkpoint = { ts: string; id: string }; // processed_time ISO + msgid
+type Checkpoint = { ts: string; id: string };
 
 async function loadCheckpoint(): Promise<Checkpoint> {
-    try { return JSON.parse(await fs.readFile(ckptFile, 'utf8')); }
-    catch { return {ts: '1970-01-01T00:00:00Z', id: ''}; }
+    try {
+        return JSON.parse(await fs.readFile(ckptFile, 'utf8'));
+    } catch (err: any) {
+        if (err.code !== 'ENOENT') throw err;           // real failure → bubble up
+
+        const init: Checkpoint = { ts: '1970-01-01 00:00:00', id: '' };
+        await saveCheckpoint(init);                     // create file + parent dirs
+        return init;
+    }
 }
 
 async function saveCheckpoint(cp: Checkpoint): Promise<void> {
-    await fs.mkdir(path.dirname(ckptFile), {recursive: true});
+    await fs.mkdir(path.dirname(ckptFile), { recursive: true });
     await fs.writeFile(ckptFile, JSON.stringify(cp));
 }
 
@@ -134,7 +141,7 @@ function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
       UNSUBSCRIBED_TIME,
       UNSUBSCRIBED_IP,
       UNSUBSCRIBED_USER_AGENT
-    FROM \`${optihookTable}\`
+    FROM \`${metricsFromSendgridTable}\`
     WHERE PROCESSED_TIME >= TIMESTAMP('${start}')
       AND PROCESSED_TIME <  TIMESTAMP('${end}')
       AND (
@@ -146,8 +153,8 @@ function buildQuery(start: string, end: string, ckpt: Checkpoint): string {
   /* ── how many rows we have already pushed per (message,event) ─────────────── */
   existing AS (
     SELECT sg_message_id, event, COUNT(*) AS pushed
-    FROM   \`${metricsTable}\`
-    WHERE  sg_message_id IN (SELECT sg_message_id FROM src)
+    FROM   \`${optihookTable}\`
+    WHERE  sg_message_id IN (SELECT sg_message_id FROM src) AND (TIMESTAMP_TRUNC(_PARTITIONTIME, DAY) BETWEEN TIMESTAMP("${start}") AND TIMESTAMP("${end}") OR _PARTITIONTIME IS NULL)
     GROUP  BY sg_message_id, event
   ),
 
@@ -394,7 +401,13 @@ async function backfill(): Promise<void> {
 
 
             if (batch.length >= batchSize) { await publish(batch); total += batch.length; batch.length = 0; }
-            ckpt = {ts: (row as MetricsRow).PROCESSED_TIME.value, id: (row as MetricsRow).sg_message_id};
+            ckpt = ckpt = {
+                ts: (row as MetricsRow).PROCESSED_TIME.value
+                    .replace('T',' ').replace('Z','')
+                    .replace(/\.(\d{6})\d+$/, '.$1'),   // keep max 6 decimals
+                id: (row as MetricsRow).sg_message_id
+            };
+
         }
         if (batch.length) { await publish(batch); total += batch.length; }
 
